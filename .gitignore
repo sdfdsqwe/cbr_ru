@@ -1,0 +1,30 @@
+# Папки сборки и кэш Maven
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# Кэш Maven локально (не нужен в репозитории)
+.m2/
+
+# Файлы IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.project
+.classpath
+
+# Файлы ОС
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Логи
+*.log
+
+# Скомпилированные классы
+*.class
+
+# Реальный файл конфигурации (с паролями!) — НИКОГДА не коммитим
+config.properties

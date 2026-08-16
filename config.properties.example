@@ -1,0 +1,13 @@
+# Пример конфигурации
+
+# HTTP-сервер
+url=http://localhost:8080/
+
+# PostgreSQL
+db.url=jdbc:postgresql://localhost:5432/postgres?currentSchema=public
+db.user=postgres
+db.password=your_password_here
+
+# Кэш
+cache.size=100
+cache.ttl=3600
