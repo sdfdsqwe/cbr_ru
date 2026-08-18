@@ -16,7 +16,12 @@ import java.time.LocalDate;
 import java.util.*;
 import java.sql.SQLException;
 
+import java.util.logging.Logger;
+import java.util.logging.Level;
+
 public class Main {
+
+    private static final Logger logger = Logger.getLogger(Main.class.getName());
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -29,6 +34,9 @@ public class Main {
 
     public static void main(String[] args) throws IOException {
 
+        // Логируем запуск приложения
+        logger.info("Application starting...");
+
         // читаем конф файл
         Properties props = new Properties();
         String configFile = System.getProperty("config.file");
@@ -36,32 +44,50 @@ public class Main {
         if (configFile != null) {
             try (FileInputStream in = new FileInputStream(configFile)) {
                 props.load(in);
-                System.out.println("Configuration loaded from: " + configFile);
+                logger.config("Configuration loaded from: " + configFile);
+
+                // Логируем все параметры конфига
+                for (String key : props.stringPropertyNames()) {
+                    String value = key.contains("password") ? "***" : props.getProperty(key);
+                    logger.config(key + " = " + value);
+                }
             } catch (Exception e) {
-                System.err.println("Failed to load config file: " + e.getMessage());
+                logger.log(Level.SEVERE, "Failed to load config file", e);
             }
         } else {
-            System.out.println("No config.file specified. Using defaults.");
+            logger.warning("No config.file specified. Using defaults.");
         }
 
-        // параметры бд
         String url = props.getProperty("url", "http://localhost:8080/");
         String dbUrl = props.getProperty("db.url", "jdbc:postgresql://localhost:5432/postgres");
         String dbUser = props.getProperty("db.user", "postgres");
         String dbPassword = props.getProperty("db.password", "postgres");
 
         // параметры кэша
-        try {
-            cacheSize = Integer.parseInt(props.getProperty("cache.size", "100"));
-            cacheTtlSeconds = Long.parseLong(props.getProperty("cache.ttl", "3600"));
-        } catch (Exception e) {
-            System.err.println("Bad cache params, using defaults");
-        }
-        System.out.println("Cache size: " + cacheSize + ", TTL: " + cacheTtlSeconds + " sec");
+        String cacheSizeStr = props.getProperty("cache.size");
+        String cacheTtlStr = props.getProperty("cache.ttl");
 
+        if (cacheSizeStr == null) {
+            throw new RuntimeException("Missing required config parameter: cache.size");
+        }
+        if (cacheTtlStr == null) {
+            throw new RuntimeException("Missing required config parameter: cache.ttl");
+        }
+
+        try {
+            cacheSize = Integer.parseInt(cacheSizeStr);
+            cacheTtlSeconds = Long.parseLong(cacheTtlStr);
+        } catch (NumberFormatException e) {
+            throw new RuntimeException("Invalid cache params: cache.size and cache.ttl must be numbers", e);
+        }
+
+        logger.config("Cache size: " + cacheSize + ", TTL: " + cacheTtlSeconds + " sec");
+
+        // создаём клиентов к БД и к ЦБ РФ
         dao = new RatesDao(dbUrl, dbUser, dbPassword);
         cbr = new CbrClient();
 
+        // запускаем HTTP сервер
         URI uri = URI.create(url);
         int port = uri.getPort();
         if (port == -1) port = 8080;
@@ -70,15 +96,31 @@ public class Main {
         server.createContext("/api/v1/rates", Main::handleRequest);
         server.createContext("/api/v1/cache/rates", Main::handleCache);
         server.start();
-        System.out.println("Server started on " + url);
+
+        logger.info("Server started on " + url);
+
+        // Обработчик остановки приложения
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            logger.info("Application shutting down...");
+            server.stop(0);
+        }));
     }
 
     private static void handleRequest(HttpExchange exchange) throws IOException {
-        Map<String, String> params = parseQueryParams(exchange.getRequestURI().getQuery());
+
+        // получение запроса
+        logger.fine("Received request: " + exchange.getRequestMethod() + " " + exchange.getRequestURI());
+
+        // содержимое запроса
+        String query = exchange.getRequestURI().getQuery();
+        logger.finer("Request query: " + query);
+
+        Map<String, String> params = parseQueryParams(query);
         String currency = params.get("targetCurrency");
         String dateStr = params.get("date");
 
         if (currency == null || currency.isBlank() || dateStr == null || dateStr.isBlank()) {
+            logger.warning("Missing parameters: targetCurrency=" + currency + ", date=" + dateStr);
             sendJson(exchange, 400, Map.of(
                     "error", "missing_parameters",
                     "message", "targetCurrency and date are required"));
@@ -89,84 +131,81 @@ public class Main {
         try {
             date = LocalDate.parse(dateStr);
         } catch (Exception e) {
+            logger.warning("Invalid date format: " + dateStr);
             sendJson(exchange, 400, Map.of(
                     "error", "invalid_date",
                     "message", "date must be in YYYY-MM-DD format"));
             return;
         }
 
+        String cur = currency.toUpperCase();
+        String[] cached = null;
+        String rate = null;
+        String cachedAt = null;
+
+        // ищем в кэше
         try {
-            String cur = currency.toUpperCase();
-            String[] cached = null;
-            String rate = null;
-            String cachedAt = null;
-
-            // ищем в кэше если БД доступна
-            try {
-                cached = dao.findRate(cur, date);
-            } catch (SQLException e) {
-                System.err.println("DB unavailable on findRate, skipping cache: " + e.getMessage());
-                cached = null;  // считаем кэш пустым
-            }
-
-            if (cached != null && isExpired(cached[1])) {
-                try {
-                    dao.deleteByDate(date);
-                } catch (SQLException e) {
-                    System.err.println("DB unavailable on deleteByDate (TTL): " + e.getMessage());
-                }
-                cached = null;
-                System.out.println("Cache EXPIRED (TTL): " + cur + " / " + date);
-            }
-
-            if (cached != null) {
-                // берём из кэша
-                rate = cached[0];
-                cachedAt = cached[1];
-                System.out.println("Cache HIT (DB): " + cur + " / " + date);
-            } else {
-                // идём в ЦБ
-                try {
-                    rate = cbr.fetchRate(cur, date);
-                } catch (Exception e) {
-                    // если и цб не досьупна
-                    sendJson(exchange, 502, Map.of(
-                            "error", "cbr_unavailable",
-                            "message", String.valueOf(e.getMessage())));
-                    return;
-                }
-
-                // сохраняем в БД
-                try {
-                    dao.saveRate(cur, date, rate);
-                } catch (SQLException e) {
-                    System.err.println("DB unavailable on saveRate, not caching: " + e.getMessage());
-                }
-
-                // контроль размера
-                try {
-                    dao.trimCache(cacheSize);
-                } catch (SQLException e) {
-                    System.err.println("DB unavailable on trimCache: " + e.getMessage());
-                }
-
-                cachedAt = Instant.now().toString();
-                System.out.println("Cache MISS -> fetched from CBR: " + cur + " / " + date);
-            }
-
-            // === ШАГ 4: собираем JSON ответ ===
-            Map<String, String> response = new LinkedHashMap<>();
-            response.put("target_currency", cur);
-            response.put("date", dateStr);
-            response.put("rate", rate);
-            response.put("cached_at", cachedAt);
-
-            sendJson(exchange, 200, response);
-
-        } catch (Exception e) {
-            e.printStackTrace();
-            sendJson(exchange, 500, Map.of("error", "internal_error", "message", String.valueOf(e.getMessage())));
+            cached = dao.findRate(cur, date);
+        } catch (SQLException e) {
+            logger.log(Level.WARNING, "DB unavailable on findRate, skipping cache", e);
+            cached = null; // если БД упала - считаем кэш пустым
         }
+
+        // проверка TTL
+        if (cached != null && isExpired(cached[1])) {
+            try {
+                dao.deleteByDate(date);
+            } catch (SQLException e) {
+                logger.log(Level.WARNING, "DB unavailable on deleteByDate (TTL)", e);
+            }
+            cached = null;
+            logger.info("Cache EXPIRED (TTL): " + cur + " / " + date);
+        }
+
+        if (cached != null) {
+            // берем из кеша
+            rate = cached[0];
+            cachedAt = cached[1];
+            logger.info("Cache HIT (DB): " + cur + " / " + date);
+        } else {
+            //идем в цб
+            try {
+                rate = cbr.fetchRate(cur, date);
+            } catch (Exception e) {
+                logger.log(Level.SEVERE, "CBR API unavailable", e);
+                sendJson(exchange, 502, Map.of(
+                        "error", "cbr_unavailable",
+                        "message", String.valueOf(e.getMessage())));
+                return;
+            }
+
+            try {
+                dao.saveRate(cur, date, rate);
+            } catch (SQLException e) {
+                logger.log(Level.WARNING, "DB unavailable on saveRate, not caching", e);
+            }
+
+            try {
+                dao.trimCache(cacheSize);
+            } catch (SQLException e) {
+                logger.log(Level.WARNING, "DB unavailable on trimCache", e);
+            }
+
+            cachedAt = Instant.now().toString();
+            logger.info("Cache MISS -> fetched from CBR: " + cur + " / " + date);
+        }
+
+        // собираем JSON ответ
+        Map<String, String> response = new LinkedHashMap<>();
+        response.put("target_currency", cur);
+        response.put("date", dateStr);
+        response.put("rate", rate);
+        response.put("cached_at", cachedAt);
+
+        // содержимое ответа
+        logger.finer("Response: " + response);
+
+        sendJson(exchange, 200, response);
     }
 
     // диспетчер get/delete
@@ -185,6 +224,8 @@ public class Main {
     }
 
     private static void handleCacheDelete(HttpExchange exchange) throws IOException {
+        logger.fine("Received DELETE request: " + exchange.getRequestURI());
+
         try {
             String dateStr = parseQueryParams(exchange.getRequestURI().getQuery()).get("date");
 
@@ -192,23 +233,24 @@ public class Main {
                     ? dao.deleteAll()
                     : dao.deleteByDate(LocalDate.parse(dateStr));
 
-            System.out.println("Cache DELETE: " + deleted + " rows (date=" + dateStr + ")");
+            logger.info("Cache DELETE: " + deleted + " rows (date=" + dateStr + ")");
             sendJson(exchange, 200, Map.of("status", "ok", "deleted", deleted));
 
         } catch (SQLException e) {
-            // БД недоступна - возвращаем ошибку
-            System.err.println("DB unavailable on cache delete: " + e.getMessage());
+            logger.log(Level.WARNING, "DB unavailable on cache delete", e);
             sendJson(exchange, 503, Map.of(
                     "error", "db_unavailable",
                     "message", "Cannot clear cache: database is unavailable"));
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.log(Level.SEVERE, "Unexpected error in cache delete", e);
             sendJson(exchange, 500, Map.of("error", "internal_error",
                     "message", String.valueOf(e.getMessage())));
         }
     }
 
     private static void handleCacheStats(HttpExchange exchange) throws IOException {
+        logger.fine("Received stats request: " + exchange.getRequestURI());
+
         try {
             List<String[]> rows = dao.findAll();
 
@@ -229,20 +271,21 @@ public class Main {
             stats.put("cache_size_max", cacheSize);
             stats.put("rates", rates);
 
+            logger.finer("Stats response: " + stats);
             sendJson(exchange, 200, stats);
 
         } catch (SQLException e) {
-            // БД недоступна - ошибка
-            System.err.println("DB unavailable on cache stats: " + e.getMessage());
+            logger.log(Level.WARNING, "DB unavailable on cache stats", e);
             sendJson(exchange, 503, Map.of(
                     "error", "db_unavailable",
                     "message", "Cannot show cache stats: database is unavailable"));
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.log(Level.SEVERE, "Unexpected error in cache stats", e);
             sendJson(exchange, 500, Map.of("error", "internal_error",
                     "message", String.valueOf(e.getMessage())));
         }
     }
+
 
     private static boolean isExpired(String cachedAt) {
         long age = Instant.now().getEpochSecond() - Instant.parse(cachedAt).getEpochSecond();
@@ -273,6 +316,7 @@ public class Main {
     }
 }
 
-// java -Dconfig.file=config.properties -jar target/cbr_ru-1.0.0.jar
+// java --% -Djava.util.logging.config.file=logging.properties -Dconfig.file=config.properties -jar target/cbr_ru-1.0.0.jar
+// curl -X DELETE "http://localhost:8080/api/v1/rates?targetCurrency=USD&date=2026-08-14"
 // http://localhost:8080/api/v1/cache/rates статистика кеша
 // http://localhost:8080/api/v1/rates?targetCurrency=USD&date=2026-08-06 курс

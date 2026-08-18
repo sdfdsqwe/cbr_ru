@@ -1,17 +1,15 @@
 package com.example;
 
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Timestamp;
+import java.sql.*;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.logging.Logger;
 
 public class RatesDao {
+
+    private static final Logger logger = Logger.getLogger(RatesDao.class.getName());
 
     private final String dbUrl;
     private final String dbUser;
@@ -21,6 +19,7 @@ public class RatesDao {
         this.dbUrl = dbUrl;
         this.dbUser = dbUser;
         this.dbPassword = dbPassword;
+        logger.config("RatesDao initialized with URL: " + dbUrl);
     }
 
     private Connection connect() throws SQLException {
