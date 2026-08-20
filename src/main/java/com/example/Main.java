@@ -141,11 +141,11 @@ public class Main {
         String cur = currency.toUpperCase();
         String[] cached = null;
         String rate = null;
+
         String cachedAt = null;
 
-        // ищем в кэше
         try {
-            cached = dao.findRate(cur, date);
+            cached = dao.findRate(cur, date); // пытаемся прочитать с бд
         } catch (SQLException e) {
             logger.log(Level.WARNING, "DB unavailable on findRate, skipping cache", e);
             cached = null; // если БД упала - считаем кэш пустым
@@ -154,6 +154,7 @@ public class Main {
         // проверка TTL
         if (cached != null && isExpired(cached[1])) {
             try {
+
                 dao.deleteByDate(date);
             } catch (SQLException e) {
                 logger.log(Level.WARNING, "DB unavailable on deleteByDate (TTL)", e);

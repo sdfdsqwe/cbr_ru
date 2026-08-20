@@ -20,8 +20,8 @@ target/
 Thumbs.db
 desktop.ini
 
-# Логи
-*.log
+# Логи приложения
+logs/
 
 # Скомпилированные классы
 *.class

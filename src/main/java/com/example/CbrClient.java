@@ -21,13 +21,20 @@ import java.time.format.DateTimeFormatter;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-public class CbrClient {
+
+public class CbrClient implements AutoCloseable {
 
     private static final Logger logger = Logger.getLogger(CbrClient.class.getName());
     private static final DateTimeFormatter CBR_FORMAT = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+
+    // 1 клиент на всё время жизни объекта
     private final HttpClient client;
 
     public CbrClient() {
+        this.client = createClient();
+    }
+
+    private static HttpClient createClient() {
         TrustManager[] trustAllCerts = new TrustManager[]{
                 new X509TrustManager() {
                     public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
@@ -35,19 +42,17 @@ public class CbrClient {
                     public void checkServerTrusted(X509Certificate[] certs, String authType) {}
                 }
         };
-
-        HttpClient builtClient;
         try {
             SSLContext sslContext = SSLContext.getInstance("TLS");
             sslContext.init(null, trustAllCerts, new SecureRandom());
-            builtClient = HttpClient.newBuilder().sslContext(sslContext).build();
+            return HttpClient.newBuilder().sslContext(sslContext).build();
         } catch (Exception e) {
             logger.log(Level.SEVERE, "SSL init failed, using default client", e);
-            builtClient = HttpClient.newHttpClient();
+            return HttpClient.newHttpClient();
         }
-        this.client = builtClient;
     }
 
+    // dозвращает курс валюты на дату
     public String fetchRate(String currency, LocalDate date) throws Exception {
 
         String cbrDate = date.format(CBR_FORMAT);
@@ -60,7 +65,9 @@ public class CbrClient {
                 .GET()
                 .build();
 
-        HttpResponse<InputStream> response = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
+        // Читаем потоком: XML-парсер сам подхватит windows-1251 из заголовка
+        HttpResponse<InputStream> response =
+                client.send(request, HttpResponse.BodyHandlers.ofInputStream());
 
         if (response.statusCode() != 200) {
             throw new RuntimeException("CBR API returned status " + response.statusCode());
@@ -82,5 +89,11 @@ public class CbrClient {
             }
         }
         throw new RuntimeException("Currency " + currency + " not found in CBR response");
+    }
+
+    // освобождам ресурсы
+    @Override
+    public void close() {
+        client.close();
     }
 }
